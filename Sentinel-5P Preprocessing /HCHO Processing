@@ -1,0 +1,252 @@
+# ============================================
+# Sentinel-5P HCHO Monthly Processing Workflow
+# ============================================
+
+"""
+Workflow Steps:
+1. Load TROPOMI HCHO data from Google Earth Engine (GEE).
+2. Convert units from mol/m² to µg/m³.
+3. Export monthly rasters to Google Drive.
+4. Fill missing values using land mask and spatial interpolation.
+5. Downscale rasters to 1 km resolution.
+6. Evaluate downscaling performance.
+7. Stack all rasters into a single multi-band file.
+
+Author: Muhammad Hilal Arrizqon & Balqis Meiliana
+"""
+
+import ee
+import os
+import glob
+import numpy as np
+import geopandas as gpd
+import rasterio
+from rasterio import features
+from rasterio.warp import calculate_default_transform, reproject, Resampling
+from scipy.interpolate import griddata
+from skimage.transform import resize
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+import rioxarray as rxr
+import xarray as xr
+import matplotlib.pyplot as plt
+
+# Initialize Earth Engine
+ee.Authenticate()
+ee.Initialize(project='...')
+
+# Define AOI
+Map = geemap.Map()
+Map
+
+AOI = ee.Geometry.Polygon([
+    [
+        [106.3984, -5.8962],
+        [106.3984, -6.6415],
+        [107.2663, -6.6415],
+        [107.2663, -5.8962]
+    ]
+])
+
+Map.addLayer(AOI, {}, "AOI")
+Map.centerObject(AOI, 8)
+
+# ===========================
+# 1) Acquire TROPOMI HCHO Data
+# ===========================
+
+HCHO_collection = (
+    ee.ImageCollection("COPERNICUS/S5P/NRTI/L3_HCHO")
+    .select('tropospheric_HCHO_column_number_density')
+    .filterDate('2022-01-01', '2024-12-31')
+    .filterBounds(AOI)
+)
+
+MOLAR_MASS_HCHO = 30.031  # g/mol
+HEIGHT_TROPOSPHERE = 10_000  # meters
+GRAM_TO_MICROGRAM = 1e6
+
+CONVERSION_FACTOR = (MOLAR_MASS_HCHO * GRAM_TO_MICROGRAM) / HEIGHT_TROPOSPHERE
+
+months = list(range(1, 13))
+years = list(range(2022, 2025))
+
+HCHO_monthly_images = []
+
+for y in years:
+    for m in months:
+        filtered = (
+            HCHO_collection
+            .filter(ee.Filter.calendarRange(y, y, 'year'))
+            .filter(ee.Filter.calendarRange(m, m, 'month'))
+        )
+
+        monthly_mean_mol = filtered.mean()
+        monthly_mean_ug = (
+            monthly_mean_mol.multiply(CONVERSION_FACTOR)
+            .clip(AOI)
+            .set('year', y)
+            .set('month', m)
+            .set('system:time_start', ee.Date.fromYMD(y, m, 1))
+            .set('label', f"HCHO_{y:04d}_{m:02d}")
+        )
+        HCHO_monthly_images.append(monthly_mean_ug)
+
+HCHO_monthly_collection = ee.ImageCollection(HCHO_monthly_images)
+
+for image in HCHO_monthly_images:
+    label = image.get('label').getInfo()
+    task = ee.batch.Export.image.toDrive(
+        image=image,
+        description=label,
+        folder='Tropomi_HCHO_Monthly',
+        fileNamePrefix=label,
+        scale=1113.2,
+        region=AOI,
+        crs='EPSG:32748',
+        maxPixels=1e13
+    )
+    task.start()
+    print(f"Export task '{label}' started.")
+
+# =====================================
+# 2) Fill Missing Values (Land Only)
+# =====================================
+
+input_folder = "/content/drive/MyDrive/Tropomi_HCHO_Monthly"
+output_folder = os.path.join(input_folder, "output_interpolated_hcho")
+shapefile_path = "/content/drive/MyDrive/JABODETABEK/JABODETABEK.shp"
+os.makedirs(output_folder, exist_ok=True)
+
+gdf = gpd.read_file(shapefile_path)
+
+raster_files = glob.glob(os.path.join(input_folder, "*.tif"))
+
+for raster_file in raster_files:
+    print(f"Processing: {os.path.basename(raster_file)}")
+
+    with rasterio.open(raster_file) as src:
+        hcho = src.read(1).astype(float)
+        hcho[hcho < 0] = np.nan
+        transform = src.transform
+        crs = src.crs
+        shape = src.shape
+
+        gdf_raster_crs = gdf.to_crs(crs)
+
+        mask = features.rasterize(
+            ((geom, 1) for geom in gdf_raster_crs.geometry),
+            out_shape=shape,
+            transform=transform,
+            fill=0,
+            dtype='uint8'
+        )
+
+        x, y = np.arange(shape[1]), np.arange(shape[0])
+        xv, yv = np.meshgrid(x, y)
+
+        x_flat, y_flat, z_flat, mask_flat = xv.flatten(), yv.flatten(), hcho.flatten(), mask.flatten()
+        valid = ~np.isnan(z_flat) & (mask_flat == 1)
+
+        z_interp = griddata(
+            (x_flat[valid], y_flat[valid]), z_flat[valid], (xv, yv), method='linear'
+        )
+
+        hcho_filled = np.where((np.isnan(hcho)) & (mask == 1), z_interp, hcho)
+
+        output_path = os.path.join(output_folder, os.path.basename(raster_file))
+        with rasterio.open(
+            output_path, "w",
+            driver="GTiff",
+            height=shape[0],
+            width=shape[1],
+            count=1,
+            dtype="float32",
+            crs=crs,
+            transform=transform
+        ) as dst:
+            dst.write(hcho_filled.astype("float32"), 1)
+
+        fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+        im1 = axs[0].imshow(hcho, cmap='viridis')
+        axs[0].set_title("Before Interpolation")
+        plt.colorbar(im1, ax=axs[0])
+
+        im2 = axs[1].imshow(hcho_filled, cmap='viridis')
+        axs[1].set_title("After Interpolation")
+        plt.colorbar(im2, ax=axs[1])
+
+        plt.suptitle(os.path.basename(raster_file))
+        plt.tight_layout()
+        plt.show()
+
+print("\n✅ All HCHO rasters filled and visualized.")
+
+# =================================
+# 3) Downscale to 1 km Resolution
+# =================================
+
+def visualize_comparison(before, after, title):
+    fig, axs = plt.subplots(1, 2, figsize=(12, 5))
+    vmin, vmax = np.nanmin([before, after]), np.nanmax([before, after])
+    im1 = axs[0].imshow(before, cmap='viridis', vmin=vmin, vmax=vmax)
+    axs[0].set_title("Before Downscaling")
+    plt.colorbar(im1, ax=axs[0])
+    im2 = axs[1].imshow(after, cmap='viridis', vmin=vmin, vmax=vmax)
+    axs[1].set_title("After Downscaling (1 km)")
+    plt.colorbar(im2, ax=axs[1])
+    plt.suptitle(title)
+    plt.tight_layout()
+    plt.show()
+
+def resample_raster_to_1km(input_path, output_path, resolution=1000, visualize=True):
+    with rasterio.open(input_path) as src:
+        src_array = src.read(1)
+        dst_transform, width, height = calculate_default_transform(
+            src.crs, src.crs, src.width, src.height, *src.bounds, resolution=resolution
+        )
+        kwargs = src.meta.copy()
+        kwargs.update({'transform': dst_transform, 'width': width, 'height': height})
+        dst_array = np.empty((height, width), dtype=src.dtypes[0])
+        reproject(
+            source=src_array,
+            destination=dst_array,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=src.crs,
+            resampling=Resampling.bilinear,
+            src_nodata=np.nan,
+            dst_nodata=np.nan
+        )
+        with rasterio.open(output_path, 'w', **kwargs) as dst:
+            dst.write(dst_array, 1)
+
+    print(f"✅ {os.path.basename(input_path)} downscaled to 1 km.")
+    if visualize:
+        visualize_comparison(src_array, dst_array, os.path.basename(input_path))
+
+input_folder = output_folder
+output_folder_resample = os.path.join(input_folder, "output_resampled_hcho")
+os.makedirs(output_folder_resample, exist_ok=True)
+
+for raster_file in glob.glob(os.path.join(input_folder, "*.tif")):
+    filename = os.path.basename(raster_file)
+    output_path = os.path.join(output_folder_resample, f"{os.path.splitext(filename)[0]}.tif")
+    resample_raster_to_1km(raster_file, output_path)
+
+# ==============================
+# 4) Stack Downscaled Layers
+# ==============================
+
+stack_input_dir = output_folder_resample
+
+raster_files = sorted(glob.glob(os.path.join(stack_input_dir, "*.tif")))
+
+raster_list = [rxr.open_rasterio(fp) for fp in raster_files]
+
+stacked_raster = xr.concat(raster_list, dim='band')
+
+stacked_output = os.path.join(stack_input_dir, "HCHO_Stacked_Jakarta.tif")
+stacked_raster.rio.to_raster(stacked_output)
+
+print(f"✅ Stacking complete: {stacked_output}")
