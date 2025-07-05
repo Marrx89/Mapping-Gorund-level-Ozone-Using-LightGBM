@@ -1,23 +1,19 @@
-# ===========================================
-# Sentinel-5P NO₂ Monthly Processing Workflow
-# ===========================================
+# ============================================
+# Sentinel-5P NO2 Monthly Processing Workflow
+# ============================================
 
 """
-This workflow:
-1. Loads TROPOMI NO₂ data from Google Earth Engine.
-2. Converts units from mol/m² to µg/m³.
-3. Exports monthly rasters.
-4. Fills missing values by spatial interpolation.
-5. Downscales rasters to 1 km resolution.
-6. Evaluates downscaling accuracy.
-7. Stacks all rasters into a single multi-band file.
+Workflow Steps:
+1. Load TROPOMI NO2 data from Google Earth Engine (GEE).
+2. Convert units from mol/m² to µg/m³.
+3. Export monthly rasters to Google Drive.
+4. Fill missing values using land mask and spatial interpolation.
+5. Downscale rasters to 1 km resolution.
+6. Evaluate downscaling performance.
+7. Stack all rasters into a single multi-band file.
 
 Author: Muhammad Hilal Arrizqon & Balqis Meiliana
 """
-
-# --------------------------
-# Earth Engine NO₂ Acquisition
-# --------------------------
 
 import ee
 import os
@@ -39,21 +35,25 @@ import matplotlib.pyplot as plt
 ee.Authenticate()
 ee.Initialize(project='...')
 
-# Define your area of interest (AOI)
+# Define AOI
 Map = geemap.Map()
 Map
 
 AOI = ee.Geometry.Polygon([
     [
-        [106.689, -6.365],
-        [107.089, -6.365],
-        [107.089, -6.065],
-        [106.689, -6.065]
+        [106.3984, -5.8962],
+        [106.3984, -6.6415],
+        [107.2663, -6.6415],
+        [107.2663, -5.8962]
     ]
 ])
 
 Map.addLayer(AOI, {}, "AOI")
 Map.centerObject(AOI, 8)
+
+# --------------------------
+# Earth Engine NO₂ Acquisition
+# --------------------------
 
 # Load TROPOMI NO₂ data
 NO2_collection = (
