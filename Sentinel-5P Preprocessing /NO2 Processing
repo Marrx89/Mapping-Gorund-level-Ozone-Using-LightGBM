@@ -29,6 +29,7 @@ from rasterio import features
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 from scipy.interpolate import griddata
 from skimage.transform import resize
+from scipy.ndimage import zoom
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import rioxarray as rxr
 import xarray as xr
